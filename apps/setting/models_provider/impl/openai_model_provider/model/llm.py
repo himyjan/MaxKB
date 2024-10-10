@@ -6,9 +6,11 @@
     @date：2024/4/18 15:28
     @desc:
 """
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 
+from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import BaseMessage, get_buffer_string
+from langchain_core.runnables import RunnableConfig
 from langchain_openai.chat_models import ChatOpenAI
 
 from common.config.tokenizer_manage_config import TokenizerManage
@@ -38,22 +40,20 @@ class OpenAIChatModel(MaxKBBaseModel, ChatOpenAI):
             openai_api_base=model_credential.get('api_base'),
             openai_api_key=model_credential.get('api_key'),
             **optional_params,
-            streaming=True,
-            stream_usage=True,
             custom_get_token_ids=custom_get_token_ids
         )
         return azure_chat_open_ai
 
     def get_num_tokens_from_messages(self, messages: List[BaseMessage]) -> int:
         try:
-            super().get_num_tokens_from_messages(messages)
+            return super().get_num_tokens_from_messages(messages)
         except Exception as e:
             tokenizer = TokenizerManage.get_tokenizer()
             return sum([len(tokenizer.encode(get_buffer_string([m]))) for m in messages])
 
     def get_num_tokens(self, text: str) -> int:
         try:
-            super().get_num_tokens(text)
+            return super().get_num_tokens(text)
         except Exception as e:
             tokenizer = TokenizerManage.get_tokenizer()
             return len(tokenizer.encode(text))

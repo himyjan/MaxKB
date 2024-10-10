@@ -14,7 +14,7 @@ import uuid
 from functools import reduce
 from typing import List, Dict
 
-import xlwt
+import openpyxl
 from celery_once import AlreadyQueued
 from django.core import validators
 from django.db import transaction
@@ -33,6 +33,9 @@ from common.handle.impl.pdf_split_handle import PdfSplitHandle
 from common.handle.impl.qa.csv_parse_qa_handle import CsvParseQAHandle
 from common.handle.impl.qa.xls_parse_qa_handle import XlsParseQAHandle
 from common.handle.impl.qa.xlsx_parse_qa_handle import XlsxParseQAHandle
+from common.handle.impl.table.csv_parse_table_handle import CsvSplitHandle
+from common.handle.impl.table.xls_parse_table_handle import XlsSplitHandle
+from common.handle.impl.table.xlsx_parse_table_handle import XlsxSplitHandle
 from common.handle.impl.text_split_handle import TextSplitHandle
 from common.mixins.api_mixin import ApiMixin
 from common.util.common import post, flat_map
@@ -44,13 +47,14 @@ from dataset.models.data_set import DataSet, Document, Paragraph, Problem, Type,
 from dataset.serializers.common_serializers import BatchSerializer, MetaSerializer, ProblemParagraphManage, \
     get_embedding_model_id_by_dataset_id
 from dataset.serializers.paragraph_serializers import ParagraphSerializers, ParagraphInstanceSerializer
-from dataset.task import sync_web_document
+from dataset.task import sync_web_document, generate_related_by_document_id
 from embedding.task.embedding import embedding_by_document, delete_embedding_by_document_list, \
     delete_embedding_by_document, update_embedding_dataset_id, delete_embedding_by_paragraph_ids, \
     embedding_by_document_list
 from smartdoc.conf import PROJECT_DIR
 
 parse_qa_handle_list = [XlsParseQAHandle(), CsvParseQAHandle(), XlsxParseQAHandle()]
+parse_table_handle_list = [CsvSplitHandle(), XlsSplitHandle(), XlsxSplitHandle()]
 
 
 class FileBufferHandle:
@@ -152,6 +156,13 @@ class DocumentInstanceQASerializer(ApiMixin, serializers.Serializer):
                                                                        error_messages=ErrMessage.file("文件")))
 
 
+class DocumentInstanceTableSerializer(ApiMixin, serializers.Serializer):
+    file_list = serializers.ListSerializer(required=True,
+                                           error_messages=ErrMessage.list("文件列表"),
+                                           child=serializers.FileField(required=True,
+                                                                       error_messages=ErrMessage.file("文件")))
+
+
 class DocumentSerializers(ApiMixin, serializers.Serializer):
     class Export(ApiMixin, serializers.Serializer):
         type = serializers.CharField(required=True, validators=[
@@ -182,6 +193,23 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                                                                   'Content-Disposition': 'attachment; filename="csv_template.csv"'})
             elif self.data.get('type') == 'excel':
                 file = open(os.path.join(PROJECT_DIR, "apps", "dataset", 'template', 'excel_template.xlsx'), "rb")
+                content = file.read()
+                file.close()
+                return HttpResponse(content, status=200, headers={'Content-Type': 'application/vnd.ms-excel',
+                                                                  'Content-Disposition': 'attachment; filename="excel_template.xlsx"'})
+
+        def table_export(self, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+
+            if self.data.get('type') == 'csv':
+                file = open(os.path.join(PROJECT_DIR, "apps", "dataset", 'template', 'MaxKB表格模板.csv'), "rb")
+                content = file.read()
+                file.close()
+                return HttpResponse(content, status=200, headers={'Content-Type': 'text/cxv',
+                                                                  'Content-Disposition': 'attachment; filename="csv_template.csv"'})
+            elif self.data.get('type') == 'excel':
+                file = open(os.path.join(PROJECT_DIR, "apps", "dataset", 'template', 'MaxKB表格模板.xlsx'), "rb")
                 content = file.read()
                 file.close()
                 return HttpResponse(content, status=200, headers={'Content-Type': 'application/vnd.ms-excel',
@@ -310,6 +338,8 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                                      error_messages=ErrMessage.char(
                                          "文档名称"))
         hit_handling_method = serializers.CharField(required=False, error_messages=ErrMessage.char("命中处理方式"))
+        is_active = serializers.BooleanField(required=False, error_messages=ErrMessage.boolean("文档是否可用"))
+        status = serializers.CharField(required=False, error_messages=ErrMessage.char("文档状态"))
 
         def get_query_set(self):
             query_set = QuerySet(model=Document)
@@ -318,6 +348,10 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 query_set = query_set.filter(**{'name__icontains': self.data.get('name')})
             if 'hit_handling_method' in self.data and self.data.get('hit_handling_method') is not None:
                 query_set = query_set.filter(**{'hit_handling_method': self.data.get('hit_handling_method')})
+            if 'is_active' in self.data and self.data.get('is_active') is not None:
+                query_set = query_set.filter(**{'is_active': self.data.get('is_active')})
+            if 'status' in self.data and self.data.get('status') is not None:
+                query_set = query_set.filter(**{'status': self.data.get('status')})
             query_set = query_set.order_by('-create_time')
             return query_set
 
@@ -456,25 +490,27 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             data_dict, document_dict = self.merge_problem(paragraph_list, problem_mapping_list, [document])
             workbook = self.get_workbook(data_dict, document_dict)
             response = HttpResponse(content_type='application/vnd.ms-excel')
-            response['Content-Disposition'] = f'attachment; filename="data.xls"'
+            response['Content-Disposition'] = f'attachment; filename="data.xlsx"'
             workbook.save(response)
             return response
 
         @staticmethod
         def get_workbook(data_dict, document_dict):
             # 创建工作簿对象
-            workbook = xlwt.Workbook(encoding='utf-8')
+            workbook = openpyxl.Workbook()
+            workbook.remove_sheet(workbook.active)
             for sheet_id in data_dict:
                 # 添加工作表
-                worksheet = workbook.add_sheet(document_dict.get(sheet_id))
+                worksheet = workbook.create_sheet(document_dict.get(sheet_id))
                 data = [
                     ['分段标题（选填）', '分段内容（必填，问题答案，最长不超过4096个字符）', '问题（选填，单元格内一行一个）'],
-                    *data_dict.get(sheet_id)
+                    *data_dict.get(sheet_id, [])
                 ]
                 # 写入数据到工作表
                 for row_idx, row in enumerate(data):
                     for col_idx, col in enumerate(row):
-                        worksheet.write(row_idx, col_idx, col)
+                        cell = worksheet.cell(row=row_idx + 1, column=col_idx + 1)
+                        cell.value = col
                     # 创建HttpResponse对象返回Excel文件
             return workbook
 
@@ -630,7 +666,15 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
             get_buffer = FileBufferHandle().get_buffer
             for parse_qa_handle in parse_qa_handle_list:
                 if parse_qa_handle.support(file, get_buffer):
-                    return parse_qa_handle.handle(file, get_buffer)
+                    return parse_qa_handle.handle(file, get_buffer, save_image)
+            raise AppApiException(500, '不支持的文件格式')
+
+        @staticmethod
+        def parse_table_file(file):
+            get_buffer = FileBufferHandle().get_buffer
+            for parse_table_handle in parse_table_handle_list:
+                if parse_table_handle.support(file, get_buffer):
+                    return parse_table_handle.handle(file, get_buffer, save_image)
             raise AppApiException(500, '不支持的文件格式')
 
         def save_qa(self, instance: Dict, with_valid=True):
@@ -639,6 +683,14 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 self.is_valid(raise_exception=True)
             file_list = instance.get('file_list')
             document_list = flat_map([self.parse_qa_file(file) for file in file_list])
+            return DocumentSerializers.Batch(data={'dataset_id': self.data.get('dataset_id')}).batch_save(document_list)
+
+        def save_table(self, instance: Dict, with_valid=True):
+            if with_valid:
+                DocumentInstanceTableSerializer(data=instance).is_valid(raise_exception=True)
+                self.is_valid(raise_exception=True)
+            file_list = instance.get('file_list')
+            document_list = flat_map([self.parse_table_file(file) for file in file_list])
             return DocumentSerializers.Batch(data={'dataset_id': self.data.get('dataset_id')}).batch_save(document_list)
 
         @post(post_function=post_embedding)
@@ -893,6 +945,52 @@ class DocumentSerializers(ApiMixin, serializers.Serializer):
                 update_dict['directly_return_similarity'] = directly_return_similarity
             QuerySet(Document).filter(id__in=document_id_list).update(**update_dict)
 
+        def batch_refresh(self, instance: Dict, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+            document_id_list = instance.get("id_list")
+            with transaction.atomic():
+                Document.objects.filter(id__in=document_id_list).update(status=Status.queue_up)
+                Paragraph.objects.filter(document_id__in=document_id_list).update(status=Status.queue_up)
+                dataset_id = self.data.get('dataset_id')
+                embedding_model_id = get_embedding_model_id_by_dataset_id(dataset_id=dataset_id)
+                for document_id in document_id_list:
+                    try:
+                        embedding_by_document.delay(document_id, embedding_model_id)
+                    except AlreadyQueued as e:
+                        raise AppApiException(500, "任务正在执行中,请勿重复下发")
+
+    class GenerateRelated(ApiMixin, serializers.Serializer):
+        document_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid("文档id"))
+
+        def is_valid(self, *, raise_exception=False):
+            super().is_valid(raise_exception=True)
+            document_id = self.data.get('document_id')
+            if not QuerySet(Document).filter(id=document_id).exists():
+                raise AppApiException(500, "文档id不存在")
+
+        def generate_related(self, model_id, prompt, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+            document_id = self.data.get('document_id')
+            QuerySet(Document).filter(id=document_id).update(status=Status.queue_up)
+            generate_related_by_document_id.delay(document_id, model_id, prompt)
+
+
+
+    class BatchGenerateRelated(ApiMixin, serializers.Serializer):
+        dataset_id = serializers.UUIDField(required=True, error_messages=ErrMessage.uuid("知识库id"))
+
+        @transaction.atomic
+        def batch_generate_related(self, instance: Dict, with_valid=True):
+            if with_valid:
+                self.is_valid(raise_exception=True)
+            document_id_list = instance.get("document_id_list")
+            model_id = instance.get("model_id")
+            prompt = instance.get("prompt")
+            for document_id in document_id_list:
+                DocumentSerializers.GenerateRelated(data={'document_id': document_id}).generate_related(model_id, prompt)
+
 
 class FileBufferHandle:
     buffer = None
@@ -908,7 +1006,8 @@ split_handles = [HTMLSplitHandle(), DocSplitHandle(), PdfSplitHandle(), default_
 
 
 def save_image(image_list):
-    QuerySet(Image).bulk_create(image_list)
+    if image_list is not None and len(image_list) > 0:
+        QuerySet(Image).bulk_create(image_list)
 
 
 def file_to_paragraph(file, pattern_list: List, with_filter: bool, limit: int):
